@@ -43,7 +43,7 @@ class ContainerInfo:
     labels: dict[str, str]
 
 
-def run_docker_command_str(args: list, check: bool = True) -> str:
+def run_docker_command_str(args: list[str], check: bool = True) -> str:
     """Run a docker command and return output as string."""
     result = cli.run_docker_command(args, check=check)
     return result.stdout.strip()
@@ -239,7 +239,12 @@ def parse_docker_time(ts: str) -> Optional[datetime]:
         return None
 
 
-def inspect_details(ids: list[str]) -> dict[str, tuple]:
+ContainerDetail = tuple[
+    str, str, Optional[datetime], Optional[datetime], str
+]  # image, state, started, finished, health
+
+
+def inspect_details(ids: list[str]) -> dict[str, ContainerDetail]:
     """
     Batch-inspect containers for original image name, state, health,
     and start/finish timestamps. Returns {id: (image, state, started,

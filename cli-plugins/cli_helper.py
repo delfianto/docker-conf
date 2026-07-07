@@ -3,10 +3,11 @@
 Common utilities for Docker CLI plugins
 """
 
+import argparse
 import json
 import subprocess
 import sys
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 # ANSI color codes
 RED = "\033[0;31m"
@@ -17,7 +18,7 @@ CYAN = "\033[1;36m"
 NC = "\033[0m"
 
 
-def handle_metadata(metadata: Dict[str, Any]) -> None:
+def handle_metadata(metadata: dict[str, Any]) -> None:
     """
     Handle Docker CLI plugin metadata requests.
 
@@ -30,7 +31,11 @@ def handle_metadata(metadata: Dict[str, Any]) -> None:
         sys.exit(0)
 
 
-def parse_plugin_args(parser, plugin_names: List[str], skip_dashes: bool = True) -> Any:
+def parse_plugin_args(
+    parser: argparse.ArgumentParser,
+    plugin_names: list[str],
+    skip_dashes: bool = True,
+) -> argparse.Namespace:
     """
     Parse arguments for a Docker CLI plugin, handling the plugin name argument.
 
@@ -54,11 +59,11 @@ def parse_plugin_args(parser, plugin_names: List[str], skip_dashes: bool = True)
 
 
 def run_docker_command(
-    args: List[str],
+    args: list[str],
     check: bool = True,
     capture_output: bool = True,
-    timeout: Optional[int] = None,
-) -> subprocess.CompletedProcess:
+    timeout: int | None = None,
+) -> subprocess.CompletedProcess[str]:
     """
     Execute a docker command and return the result.
 

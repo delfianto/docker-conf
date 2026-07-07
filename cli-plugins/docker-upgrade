@@ -255,7 +255,7 @@ def check_image(image: str) -> CheckResult:
     return CheckResult(image, CheckStatus.NEEDS_UPDATE)
 
 
-def check_images_parallel(images: list, max_workers: int) -> list[CheckResult]:
+def check_images_parallel(images: list[str], max_workers: int) -> list[CheckResult]:
     """Check all images for updates in parallel."""
     cli.print_info(f"Checking for updates ({max_workers} concurrent checks)...\n")
 

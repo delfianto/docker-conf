@@ -31,8 +31,9 @@ limit and eventually slams the door.
 ## The plugins
 
 All plugins live in `cli-plugins/` and register as regular docker
-subcommands. Python 3.11+, no dependencies outside the standard library,
-because adding a `requirements.txt` to fix `docker ps` felt like losing.
+subcommands. Python 3.14+, standard library only — except `pstats`,
+which uses [rich](https://github.com/Textualize/rich), because rendering
+a live dashboard with raw ANSI codes is how you end up writing btop.
 
 ### `docker pps` — ps, but legible
 
@@ -57,6 +58,31 @@ valkey  0d4d6926b5a9  valkey/valkey:9-alpine                      ● 01:08     
   was started from, flagged `(outdated)` so you know a recreate is due.
 - `docker pps -v [name]` prints the long form: mounts, networks, labels,
   the works — the stuff `docker inspect` hides inside a JSON haystack.
+
+### `docker pstats` — stats, but it's a dashboard
+
+`docker stats` is a jittering wall of misaligned columns that can't tell
+you the one thing you opened it for: how much is docker using *in total*.
+This is the btop-flavored answer:
+
+```
+CPU  █░░░░░░░░░░░░░░░░░░░░░░░░░░░░░    4.0% of 32 cores
+MEM  █░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  2.2G / 62.3G (4%)
+11 running / 11 containers  ·  346 pids  ·  net ↓155M ↑569M  ·  disk R 1.9G W 987M
+
+ NAME         CPU                     MEM    MEM%        NET ↓/↑        DISK R/W   PIDS      UP
+ valkey       █░░░░░░░░░   1.7%     30.1M    5.9%    4.7M / 2.8M    2.9M / 75.1M      8   01:53
+ plex         ░░░░░░░░░░   0.1%     44.9M    2.2%   4.1M / 469M    728M / 80.7M     53   1d 16:14
+ ...
+```
+
+Overall gauges on top — total CPU against your actual core count, total
+memory against your actual RAM, aggregate pids and I/O — then one clean,
+aligned, color-coded row per container with uptime. Rows sort by name so
+they hold still — the bars and colors already tell you who's being loud.
+Live by default (1.5s refresh, Ctrl-C to leave), `--refresh` to change
+the cadence, `--once` for a single snapshot, `--sort cpu|mem|pids` when
+you do want the loudest on top.
 
 ### `docker upgrade` — apt upgrade for your images
 
@@ -121,4 +147,6 @@ Run `docker pps` and enjoy output that fits on hardware you actually own.
 
 - Docker with the CLI plugin system (anything from this decade)
 - Python ≥ 3.14
+- [rich](https://github.com/Textualize/rich) (only for `docker pstats`;
+  `pacman -S python-rich` or equivalent)
 - buildx (optional, only for `docker upgrade` against private registries)

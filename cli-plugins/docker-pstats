@@ -1,0 +1,447 @@
+#!/usr/bin/env python3
+"""Docker CLI plugin for a live, btop-style container stats dashboard."""
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import threading
+import time
+from typing import Any
+
+from rich import box
+from rich.console import Console, Group, RenderableType
+from rich.table import Table
+from rich.text import Text
+
+try:
+    import cli_helper as cli
+except ImportError:
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import cli_helper as cli
+
+PLUGIN_METADATA = {
+    "SchemaVersion": "0.1.0",
+    "Vendor": "delfianto",
+    "Version": "1.0.0",
+    "ShortDescription": "Live container stats dashboard with overall usage gauges",
+}
+
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+SIZE_RE = re.compile(r"([\d.]+)\s*([A-Za-z]+)?")
+
+SIZE_UNITS = {
+    "B": 1,
+    "kB": 10**3,
+    "KB": 10**3,
+    "KiB": 2**10,
+    "MB": 10**6,
+    "MiB": 2**20,
+    "GB": 10**9,
+    "GiB": 2**30,
+    "TB": 10**12,
+    "TiB": 2**40,
+}
+
+BAR_WIDTH = 30
+
+
+def parse_size(text: str) -> float:
+    """Parse a docker human size string ("18.2MiB", "59.7MB") to bytes."""
+    match = SIZE_RE.match(text.strip())
+    if not match:
+        return 0.0
+    value, unit = match.groups()
+    return float(value) * SIZE_UNITS.get(unit or "B", 1)
+
+
+def parse_io_pair(text: str) -> tuple[float, float]:
+    """Parse an "in / out" size pair to bytes."""
+    parts = text.split("/")
+    if len(parts) != 2:
+        return 0.0, 0.0
+    return parse_size(parts[0]), parse_size(parts[1])
+
+
+def parse_percent(text: str) -> float:
+    """Parse a "12.34%" string to a float."""
+    try:
+        return float(text.strip().rstrip("%"))
+    except ValueError:
+        return 0.0
+
+
+def fmt_bytes(n: float) -> str:
+    """Format bytes as a short human string."""
+    for unit in ("B", "K", "M", "G"):
+        if n < 1024:
+            return f"{n:.0f}{unit}" if unit == "B" else f"{n:.1f}{unit}"
+        n /= 1024
+    return f"{n:.1f}T"
+
+
+def host_memory_total() -> float:
+    """Total host memory in bytes from /proc/meminfo."""
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    return float(line.split()[1]) * 1024
+    except OSError:
+        pass
+    return 0.0
+
+
+def usage_color(fraction: float) -> str:
+    """Green below 50%, yellow below 80%, red above."""
+    if fraction < 0.5:
+        return "green"
+    if fraction < 0.8:
+        return "yellow"
+    return "red"
+
+
+def make_bar(fraction: float, width: int = BAR_WIDTH) -> Text:
+    """Render a usage bar."""
+    fraction = max(0.0, min(1.0, fraction))
+    filled = round(fraction * width)
+    bar = Text()
+    bar.append("█" * filled, style=usage_color(fraction))
+    bar.append("░" * (width - filled), style="grey35")
+    return bar
+
+
+class StatsStream(threading.Thread):
+    """Consumes the docker stats JSON stream in the background."""
+
+    def __init__(self) -> None:
+        super().__init__(daemon=True)
+        self.lock = threading.Lock()
+        self.containers: dict[str, dict[str, Any]] = {}
+        self.primed = False
+        self.error: str | None = None
+        self.proc: subprocess.Popen[str] | None = None
+
+    def run(self) -> None:
+        try:
+            self.proc = subprocess.Popen(
+                ["docker", "stats", "--format", "{{json .}}"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+        except FileNotFoundError:
+            self.error = "docker command not found"
+            return
+
+        assert self.proc.stdout is not None
+        batch: dict[str, dict[str, Any]] = {}
+
+        for raw in self.proc.stdout:
+            # Docker prefixes each refresh batch with a cursor-home escape
+            if "\x1b[H" in raw:
+                with self.lock:
+                    self.containers = batch
+                    # The first batch reports 0% CPU while docker primes
+                    self.primed = bool(batch)
+                batch = {}
+
+            line = ANSI_RE.sub("", raw).strip()
+            if not line:
+                continue
+            try:
+                data = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            cid = (data.get("ID") or data.get("Container") or "")[:12]
+            if cid:
+                batch[cid] = data
+
+        if self.proc.stderr is not None:
+            err = self.proc.stderr.read().strip()
+            if err:
+                self.error = err.split("\n")[0]
+
+    def stop(self) -> None:
+        if self.proc is not None and self.proc.poll() is None:
+            self.proc.terminate()
+
+
+class PsWatcher(threading.Thread):
+    """Periodically refreshes container metadata (uptime, totals)."""
+
+    def __init__(self, interval: float = 5.0) -> None:
+        super().__init__(daemon=True)
+        self.interval = interval
+        self.lock = threading.Lock()
+        self.started: dict[str, Any] = {}
+        self.total = 0
+        self._stop = threading.Event()
+
+    def run(self) -> None:
+        while not self._stop.is_set():
+            self.refresh()
+            self._stop.wait(self.interval)
+
+    def refresh(self) -> None:
+        result = cli.run_docker_command(
+            ["ps", "-a", "--format", "{{.ID}}\t{{.State}}"], check=False
+        )
+        if result.returncode != 0:
+            return
+
+        rows = [line.split("\t") for line in result.stdout.strip().split("\n") if line]
+        running = [r[0][:12] for r in rows if len(r) == 2 and r[1] == "running"]
+
+        started: dict[str, Any] = {}
+        if running:
+            inspected = cli.run_docker_command(
+                ["inspect", "--format", "{{.State.StartedAt}}"] + running,
+                check=False,
+            )
+            if inspected.returncode == 0:
+                for cid, line in zip(
+                    running, inspected.stdout.strip("\n").split("\n")
+                ):
+                    started[cid] = cli.parse_docker_time(line.strip())
+
+        with self.lock:
+            self.started = started
+            self.total = len(rows)
+
+    def stop(self) -> None:
+        self._stop.set()
+
+
+def build_dashboard(
+    stats: dict[str, dict[str, Any]],
+    started: dict[str, Any],
+    total_containers: int,
+    ncpu: int,
+    mem_total: float,
+    sort_key: str,
+) -> RenderableType:
+    """Compose the gauges header and per-container table."""
+    rows: list[dict[str, Any]] = []
+    for cid, s in stats.items():
+        mem_used, _ = parse_io_pair(s.get("MemUsage", ""))
+        rx, tx = parse_io_pair(s.get("NetIO", ""))
+        blk_r, blk_w = parse_io_pair(s.get("BlockIO", ""))
+        rows.append(
+            {
+                "name": s.get("Name", cid),
+                "cpu": parse_percent(s.get("CPUPerc", "")),
+                "mem": mem_used,
+                "mem_pct": parse_percent(s.get("MemPerc", "")),
+                "rx": rx,
+                "tx": tx,
+                "blk_r": blk_r,
+                "blk_w": blk_w,
+                "pids": int(s.get("PIDs") or 0),
+                "up": cli.format_clock(started.get(cid)),
+            }
+        )
+
+    reverse = sort_key != "name"
+    rows.sort(key=lambda r: r[sort_key], reverse=reverse)
+
+    total_cpu = sum(r["cpu"] for r in rows)
+    total_mem = sum(r["mem"] for r in rows)
+    total_pids = sum(r["pids"] for r in rows)
+    total_rx = sum(r["rx"] for r in rows)
+    total_tx = sum(r["tx"] for r in rows)
+    total_blk_r = sum(r["blk_r"] for r in rows)
+    total_blk_w = sum(r["blk_w"] for r in rows)
+
+    cpu_frac = total_cpu / (ncpu * 100) if ncpu else 0.0
+    mem_frac = total_mem / mem_total if mem_total else 0.0
+
+    cpu_line = Text.assemble(("CPU  ", "bold cyan"))
+    cpu_line.append_text(make_bar(cpu_frac))
+    cpu_line.append(
+        f" {total_cpu:6.1f}% of {ncpu} cores", style=usage_color(cpu_frac)
+    )
+
+    mem_line = Text.assemble(("MEM  ", "bold cyan"))
+    mem_line.append_text(make_bar(mem_frac))
+    mem_line.append(
+        f" {fmt_bytes(total_mem)} / {fmt_bytes(mem_total)} ({mem_frac * 100:.0f}%)",
+        style=usage_color(mem_frac),
+    )
+
+    totals_line = Text.assemble(
+        (f"{len(rows)}", "bold green"),
+        (f" running / {total_containers} containers", "grey62"),
+        ("  ·  ", "grey35"),
+        (f"{total_pids} pids", "grey62"),
+        ("  ·  ", "grey35"),
+        (f"net ↓{fmt_bytes(total_rx)} ↑{fmt_bytes(total_tx)}", "grey62"),
+        ("  ·  ", "grey35"),
+        (f"disk R {fmt_bytes(total_blk_r)} W {fmt_bytes(total_blk_w)}", "grey62"),
+    )
+
+    table = Table(box=box.SIMPLE_HEAD, header_style="bold cyan", pad_edge=False)
+    table.add_column("NAME", style="bold")
+    table.add_column("CPU", min_width=18)
+    table.add_column("MEM", justify="right")
+    table.add_column("MEM%", justify="right")
+    table.add_column("NET ↓/↑", justify="right")
+    table.add_column("DISK R/W", justify="right")
+    table.add_column("PIDS", justify="right")
+    table.add_column("UP", justify="right")
+
+    for r in rows:
+        # Per-container bar is scaled to a single core
+        cpu_cell = make_bar(r["cpu"] / 100, width=10)
+        cpu_cell.append(
+            f" {r['cpu']:5.1f}%", style=usage_color(r["cpu"] / 100)
+        )
+        mem_frac_row = r["mem_pct"] / 100
+        table.add_row(
+            r["name"],
+            cpu_cell,
+            Text(fmt_bytes(r["mem"]), style=usage_color(mem_frac_row)),
+            Text(f"{r['mem_pct']:.1f}%", style=usage_color(mem_frac_row)),
+            f"{fmt_bytes(r['rx'])} / {fmt_bytes(r['tx'])}",
+            f"{fmt_bytes(r['blk_r'])} / {fmt_bytes(r['blk_w'])}",
+            str(r["pids"]),
+            r["up"],
+        )
+
+    if not rows:
+        return Group(cpu_line, mem_line, totals_line, "", "  no running containers")
+    return Group(cpu_line, mem_line, totals_line, table)
+
+
+def snapshot(sort_key: str) -> int:
+    """One-shot mode: sample once and print."""
+    result = cli.run_docker_command(
+        ["stats", "--no-stream", "--format", "{{json .}}"], check=False, timeout=30
+    )
+    if result.returncode != 0:
+        cli.print_error(result.stderr.strip().split("\n")[0] or "docker stats failed")
+        return 1
+
+    stats: dict[str, dict[str, Any]] = {}
+    for raw in result.stdout.split("\n"):
+        line = ANSI_RE.sub("", raw).strip()
+        if not line:
+            continue
+        try:
+            data = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        cid = (data.get("ID") or data.get("Container") or "")[:12]
+        if cid:
+            stats[cid] = data
+
+    watcher = PsWatcher()
+    watcher.refresh()
+
+    console = Console()
+    console.print(
+        build_dashboard(
+            stats,
+            watcher.started,
+            watcher.total,
+            os.cpu_count() or 1,
+            host_memory_total(),
+            sort_key,
+        )
+    )
+    return 0
+
+
+def live(sort_key: str, refresh: float) -> int:
+    """Live dashboard mode."""
+    from rich.live import Live
+
+    ncpu = os.cpu_count() or 1
+    mem_total = host_memory_total()
+
+    stream = StatsStream()
+    watcher = PsWatcher()
+    stream.start()
+    watcher.start()
+
+    console = Console()
+    waiting = Text("collecting stats…", style="grey62")
+
+    try:
+        with Live(
+            waiting, console=console, screen=True, auto_refresh=False
+        ) as view:
+            while True:
+                if stream.error:
+                    break
+                with stream.lock:
+                    stats = dict(stream.containers)
+                    primed = stream.primed
+                with watcher.lock:
+                    started = dict(watcher.started)
+                    total = watcher.total
+                if primed:
+                    view.update(
+                        build_dashboard(
+                            stats, started, total, ncpu, mem_total, sort_key
+                        ),
+                        refresh=True,
+                    )
+                time.sleep(refresh)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        stream.stop()
+        watcher.stop()
+
+    if stream.error:
+        cli.print_error(f"Error: {stream.error}")
+        return 1
+    return 0
+
+
+def main() -> int:
+    """Main function."""
+    cli.handle_metadata(PLUGIN_METADATA)
+
+    parser = argparse.ArgumentParser(
+        description="Live container stats dashboard with overall usage gauges",
+    )
+    parser.add_argument(
+        "-1",
+        "--once",
+        action="store_true",
+        help="Print a single snapshot instead of the live dashboard",
+    )
+    parser.add_argument(
+        "-s",
+        "--sort",
+        choices=["name", "cpu", "mem", "pids"],
+        default="name",
+        help="Sort containers by column (default: name, keeps row order stable)",
+    )
+    parser.add_argument(
+        "-r",
+        "--refresh",
+        type=float,
+        default=1.5,
+        help="Dashboard refresh interval in seconds (default: 1.5)",
+    )
+
+    args = cli.parse_plugin_args(parser, ["docker-pstats", "pstats"])
+
+    # Below 0.5s the dashboard would just outpace docker's ~1s stats tick
+    refresh = max(0.5, args.refresh)
+
+    try:
+        if args.once:
+            return snapshot(args.sort)
+        return live(args.sort, refresh)
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())

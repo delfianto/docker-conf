@@ -5,8 +5,10 @@ Common utilities for Docker CLI plugins
 
 import argparse
 import json
+import re
 import subprocess
 import sys
+from datetime import UTC, datetime
 from typing import Any
 
 # ANSI color codes
@@ -16,6 +18,30 @@ YELLOW = "\033[1;33m"
 BLUE = "\033[0;34m"
 CYAN = "\033[1;36m"
 NC = "\033[0m"
+
+
+def parse_docker_time(ts: str) -> datetime | None:
+    """Parse a docker RFC3339 timestamp; None for empty/zero values."""
+    if not ts or ts.startswith("0001-01-01"):
+        return None
+    # Trim nanoseconds to microseconds for fromisoformat
+    ts = re.sub(r"\.(\d{6})\d*", r".\1", ts.replace("Z", "+00:00"))
+    try:
+        return datetime.fromisoformat(ts)
+    except ValueError:
+        return None
+
+
+def format_clock(since: datetime | None) -> str:
+    """Format elapsed time since a timestamp as HH:MM, or Xd HH:MM past a day."""
+    if since is None:
+        return "--:--"
+    seconds = max(0, (datetime.now(UTC) - since).total_seconds())
+    hours, minutes = divmod(int(seconds // 60), 60)
+    days, hours = divmod(hours, 24)
+    if days:
+        return f"{days}d {hours:02d}:{minutes:02d}"
+    return f"{hours:02d}:{minutes:02d}"
 
 
 def handle_metadata(metadata: dict[str, Any]) -> None:

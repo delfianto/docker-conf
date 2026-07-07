@@ -6,8 +6,7 @@ import json
 import re
 import sys
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from typing import Optional
+from datetime import datetime, UTC
 
 try:
     import cli_helper as cli
@@ -103,7 +102,7 @@ def get_container_labels(container_id: str) -> dict[str, str]:
 
 def get_container_info(
     container_id: str, show_all: bool = True
-) -> Optional[ContainerInfo]:
+) -> ContainerInfo | None:
     """Get detailed information about a container."""
     all_flag = ["--all"] if show_all else []
 
@@ -227,7 +226,7 @@ def parse_port_lines(ports_str: str) -> list[str]:
     return lines
 
 
-def parse_docker_time(ts: str) -> Optional[datetime]:
+def parse_docker_time(ts: str) -> datetime | None:
     """Parse a docker RFC3339 timestamp; None for empty/zero values."""
     if not ts or ts.startswith("0001-01-01"):
         return None
@@ -239,8 +238,8 @@ def parse_docker_time(ts: str) -> Optional[datetime]:
         return None
 
 
-ContainerDetail = tuple[
-    str, str, Optional[datetime], Optional[datetime], str
+type ContainerDetail = tuple[
+    str, str, datetime | None, datetime | None, str
 ]  # image, state, started, finished, health
 
 
@@ -279,11 +278,11 @@ def inspect_details(ids: list[str]) -> dict[str, ContainerDetail]:
     return details
 
 
-def format_clock(since: Optional[datetime]) -> str:
+def format_clock(since: datetime | None) -> str:
     """Format elapsed time since a timestamp as HH:MM, or Xd HH:MM past a day."""
     if since is None:
         return "--:--"
-    seconds = max(0, (datetime.now(timezone.utc) - since).total_seconds())
+    seconds = max(0, (datetime.now(UTC) - since).total_seconds())
     hours, minutes = divmod(int(seconds // 60), 60)
     days, hours = divmod(hours, 24)
     if days:
@@ -294,8 +293,8 @@ def format_clock(since: Optional[datetime]) -> str:
 def status_cell(
     state: str,
     health: str,
-    started: Optional[datetime],
-    finished: Optional[datetime],
+    started: datetime | None,
+    finished: datetime | None,
 ) -> tuple[str, str]:
     """
     Build the STATUS column cell: icon + elapsed HH:MM.
@@ -379,7 +378,7 @@ def show_brief_format(show_all: bool = True):
     return 0
 
 
-def show_detail_format(container_name: Optional[str] = None, show_all: bool = True):
+def show_detail_format(container_name: str | None = None, show_all: bool = True):
     """Display containers in verbose/detail format."""
     all_flag = ["--all"] if show_all else []
 

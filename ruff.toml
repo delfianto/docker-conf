@@ -1,0 +1,7 @@
+target-version = "py314"
+
+# The docker CLI plugins are extensionless Python scripts
+include = ["cli-plugins/*.py", "cli-plugins/docker-*"]
+
+[lint]
+extend-select = ["UP"]

@@ -1,0 +1,19 @@
+{
+  "auths": {},
+  "ipv6": false,
+  "dns": ["10.0.10.1", "1.1.1.1"],
+  "features": {
+    "cdi": true
+  },
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "10m",
+    "max-file": "3"
+  },
+  "runtimes": {
+    "nvidia": {
+      "path": "nvidia-container-runtime",
+      "runtimeArgs": []
+    }
+  }
+}

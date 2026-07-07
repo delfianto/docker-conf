@@ -1,0 +1,476 @@
+#!/usr/bin/env python3
+"""Docker CLI plugin to pretty print docker ps with multiple output formats."""
+
+import argparse
+import json
+import re
+import sys
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Optional
+
+try:
+    import cli_helper as cli
+except ImportError:
+    import os
+
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import cli_helper as cli
+
+PLUGIN_METADATA = {
+    "SchemaVersion": "0.1.0",
+    "Vendor": "delfianto",
+    "Version": "1.0.0",
+    "ShortDescription": "Pretty print docker ps with multiple output formats",
+}
+
+
+@dataclass
+class ContainerInfo:
+    """Container information structure."""
+
+    name: str
+    id: str
+    image: str
+    status: str
+    created: str
+    running_for: str
+    ports: str
+    networks: str
+    size: str
+    command: str
+    mounts: list[str]
+    labels: dict[str, str]
+
+
+def run_docker_command_str(args: list, check: bool = True) -> str:
+    """Run a docker command and return output as string."""
+    result = cli.run_docker_command(args, check=check)
+    return result.stdout.strip()
+
+
+def get_container_command(container_id: str) -> str:
+    """Get the full command for a container (handles both Cmd and Entrypoint)."""
+    try:
+        config_json = run_docker_command_str(
+            ["inspect", "--format", "{{json .Config}}", container_id]
+        )
+        config = json.loads(config_json)
+
+        # Prefer Cmd, fallback to Entrypoint
+        if config.get("Cmd"):
+            return " ".join(config["Cmd"])
+        elif config.get("Entrypoint"):
+            return " ".join(config["Entrypoint"])
+        else:
+            return "N/A"
+    except (json.JSONDecodeError, KeyError):
+        return "N/A"
+
+
+def get_container_mounts(container_id: str) -> list[str]:
+    """Get container mounts as a sorted list."""
+    try:
+        mounts_json = run_docker_command_str(
+            ["inspect", "--format", "{{json .Mounts}}", container_id]
+        )
+        mounts = json.loads(mounts_json)
+        mount_list = []
+
+        for mount in mounts:
+            source = mount.get("Source", "")
+            destination = mount.get("Destination", "")
+            mode = mount.get("Mode", "")
+            if source and destination:
+                mount_list.append(f"{source}:{destination}:{mode}")
+
+        return sorted(mount_list)
+    except json.JSONDecodeError:
+        return []
+
+
+def get_container_labels(container_id: str) -> dict[str, str]:
+    """Get container labels as a sorted dictionary."""
+    try:
+        labels_json = run_docker_command_str(
+            ["inspect", "--format", "{{json .Config.Labels}}", container_id]
+        )
+        labels = json.loads(labels_json)
+        return dict(sorted(labels.items())) if labels else {}
+    except json.JSONDecodeError:
+        return {}
+
+
+def get_container_info(
+    container_id: str, show_all: bool = True
+) -> Optional[ContainerInfo]:
+    """Get detailed information about a container."""
+    all_flag = ["--all"] if show_all else []
+
+    try:
+        # Get basic info from docker ps
+        ps_format = "{{.Names}}\t{{.ID}}\t{{.Image}}\t{{.Status}}\t{{.CreatedAt}}\t{{.RunningFor}}\t{{.Ports}}\t{{.Networks}}\t{{.Size}}"
+        output = run_docker_command_str(
+            ["ps"]
+            + all_flag
+            + ["--filter", f"id={container_id}", "--format", ps_format]
+        )
+
+        if not output:
+            return None
+
+        parts = output.split("\t")
+        if len(parts) < 9:
+            return None
+
+        name, id_, image, status, created, running_for, ports, networks, size = parts
+
+        # Get additional info
+        command = get_container_command(container_id)
+        mounts = get_container_mounts(container_id)
+        labels = get_container_labels(container_id)
+
+        return ContainerInfo(
+            name=name,
+            id=id_,
+            image=image,
+            status=status,
+            created=created,
+            running_for=running_for,
+            ports=ports,
+            networks=networks,
+            size=size,
+            command=command,
+            mounts=mounts,
+            labels=labels,
+        )
+    except Exception:
+        return None
+
+
+def format_json_value(value: str, indent: int = 4) -> str:
+    """Format a JSON string value with proper indentation and colors."""
+    if not (value.startswith("{") or value.startswith("[")):
+        return value
+
+    try:
+        obj = json.loads(value)
+        formatted = json.dumps(obj, indent=2)
+        # Add indentation to each line
+        lines = formatted.split("\n")
+        return "\n" + "\n".join(" " * indent + line for line in lines)
+    except json.JSONDecodeError:
+        return value
+
+
+def print_container_detail(info: ContainerInfo):
+    """Print detailed information about a container."""
+    print(f"\n{cli.CYAN}{'━' * 78}{cli.NC}")
+    print(f"{cli.CYAN}Container Information:{cli.NC}")
+    print(f"  {cli.GREEN}Name:{cli.NC} {info.name}")
+    print(f"  {cli.YELLOW}ID:{cli.NC} {info.id}")
+    print(f"  {cli.CYAN}Image:{cli.NC} {info.image}")
+    print(f"  {cli.BLUE}Command:{cli.NC} {info.command}")
+    print(f"  {cli.RED}Status:{cli.NC} {info.status}")
+    print(f"  {cli.GREEN}Created:{cli.NC} {info.created}")
+    print(f"  {cli.YELLOW}Running For:{cli.NC} {info.running_for}")
+    print(f"  {cli.CYAN}Ports:{cli.NC} {info.ports}")
+    print(f"  {cli.BLUE}Networks:{cli.NC} {info.networks}")
+    print(f"  {cli.YELLOW}Size:{cli.NC} {info.size}")
+
+    # Print mounts
+    if info.mounts:
+        print(f"  {cli.GREEN}Mounts:{cli.NC}")
+        for mount in info.mounts:
+            print(f"    {cli.GREEN}•{cli.NC} {mount}")
+
+    # Print labels
+    if info.labels:
+        print(f"  {cli.CYAN}Labels:{cli.NC}")
+        for key, value in info.labels.items():
+            # Check if value is JSON
+            if value.startswith("{") or value.startswith("["):
+                formatted_value = format_json_value(value, indent=6)
+                print(f"    {cli.CYAN}•{cli.NC} {key}={formatted_value}")
+            else:
+                print(f"    {cli.CYAN}•{cli.NC} {key}={value}")
+
+
+def parse_port_lines(ports_str: str) -> list[str]:
+    """Split docker's ports string into one readable entry per line."""
+    if not ports_str:
+        return []
+
+    entries = [e.strip() for e in ports_str.split(",") if e.strip()]
+    bound = [e for e in entries if "->" in e]
+    exposed = [e for e in entries if "->" not in e]
+
+    # Drop IPv6 wildcard binds that duplicate an IPv4 wildcard bind
+    bound_set = set(bound)
+    bound = [
+        e
+        for e in bound
+        if not (e.startswith("[::]:") and f"0.0.0.0:{e[5:]}" in bound_set)
+    ]
+
+    def host_port(entry: str) -> int:
+        host = entry.split("->", 1)[0]
+        port = host.rsplit(":", 1)[-1]
+        try:
+            return int(port.split("-", 1)[0])
+        except ValueError:
+            return 0
+
+    lines = sorted(bound, key=host_port)
+    if exposed:
+        lines.append(", ".join(exposed))
+    return lines
+
+
+def parse_docker_time(ts: str) -> Optional[datetime]:
+    """Parse a docker RFC3339 timestamp; None for empty/zero values."""
+    if not ts or ts.startswith("0001-01-01"):
+        return None
+    # Trim nanoseconds to microseconds for fromisoformat
+    ts = re.sub(r"\.(\d{6})\d*", r".\1", ts.replace("Z", "+00:00"))
+    try:
+        return datetime.fromisoformat(ts)
+    except ValueError:
+        return None
+
+
+def inspect_details(ids: list[str]) -> dict[str, tuple]:
+    """
+    Batch-inspect containers for original image name, state, health,
+    and start/finish timestamps. Returns {id: (image, state, started,
+    finished, health)}.
+    """
+    fmt = "\t".join(
+        (
+            "{{.Config.Image}}",
+            "{{.State.Status}}",
+            "{{.State.StartedAt}}",
+            "{{.State.FinishedAt}}",
+            "{{with .State.Health}}{{.Status}}{{end}}",
+        )
+    )
+    result = cli.run_docker_command(["inspect", "--format", fmt] + ids, check=False)
+    if result.returncode != 0 or not result.stdout.strip():
+        return {}
+
+    details = {}
+    for cid, line in zip(ids, result.stdout.strip("\n").split("\n")):
+        parts = line.split("\t")
+        if len(parts) != 5:
+            continue
+        image, state, started, finished, health = parts
+        details[cid] = (
+            image,
+            state,
+            parse_docker_time(started),
+            parse_docker_time(finished),
+            health,
+        )
+    return details
+
+
+def format_clock(since: Optional[datetime]) -> str:
+    """Format elapsed time since a timestamp as HH:MM, or Xd HH:MM past a day."""
+    if since is None:
+        return "--:--"
+    seconds = max(0, (datetime.now(timezone.utc) - since).total_seconds())
+    hours, minutes = divmod(int(seconds // 60), 60)
+    days, hours = divmod(hours, 24)
+    if days:
+        return f"{days}d {hours:02d}:{minutes:02d}"
+    return f"{hours:02d}:{minutes:02d}"
+
+
+def status_cell(
+    state: str,
+    health: str,
+    started: Optional[datetime],
+    finished: Optional[datetime],
+) -> tuple[str, str]:
+    """
+    Build the STATUS column cell: icon + elapsed HH:MM.
+
+    Running shows uptime, stopped shows time since exit; color carries
+    health (green ok, yellow starting/paused, red unhealthy/exited).
+    """
+    if state in ("running", "restarting", "paused"):
+        if state == "running":
+            color = {"starting": cli.YELLOW, "unhealthy": cli.RED}.get(
+                health, cli.GREEN
+            )
+        else:
+            color = cli.YELLOW
+        return f"● {format_clock(started)}", color
+
+    if state == "created":
+        return "○ --:--", cli.BLUE
+
+    # exited, dead, removing
+    return f"○ {format_clock(finished)}", cli.RED
+
+
+def show_brief_format(show_all: bool = True):
+    """Display containers in brief table format with one port mapping per line."""
+    all_flag = ["--all"] if show_all else []
+
+    try:
+        output = run_docker_command_str(["ps"] + all_flag + ["--format", "{{json .}}"])
+    except Exception as e:
+        cli.print_error(f"Error: {e}")
+        return 1
+
+    if not output:
+        print("No containers found")
+        return 0
+
+    rows = [json.loads(line) for line in output.split("\n") if line]
+    rows.sort(key=lambda r: r["Names"])
+    details = inspect_details([r["ID"] for r in rows])
+
+    table = []
+    for r in rows:
+        ports = parse_port_lines(r.get("Ports", "")) or ["-"]
+        image = r["Image"]
+
+        detail = details.get(r["ID"])
+        if detail:
+            cfg_image, state, started, finished, health = detail
+            # docker ps shows a bare ID when the tag has since moved to a
+            # newer image; recover the name the container was started from
+            if cfg_image and re.fullmatch(r"[0-9a-f]{12,64}|sha256:[0-9a-f]+", image):
+                image = f"{cfg_image} (outdated)"
+            status, color = status_cell(state, health, started, finished)
+        else:
+            status, color = r.get("Status", "?"), ""
+
+        table.append((r["Names"], r["ID"], image, status, color, ports))
+
+    name_w = max(len("NAMES"), max(len(t[0]) for t in table))
+    id_w = max(len("ID"), max(len(t[1]) for t in table))
+    image_w = max(len("IMAGE"), max(len(t[2]) for t in table))
+    status_w = max(len("STATUS"), max(len(t[3]) for t in table))
+
+    header = (
+        f"{'NAMES':<{name_w}}  {'ID':<{id_w}}  "
+        f"{'IMAGE':<{image_w}}  {'STATUS':<{status_w}}  PORTS"
+    )
+    print(f"{cli.CYAN}{header}{cli.NC}")
+
+    indent = " " * (name_w + id_w + image_w + status_w + 8)
+    for name, cid, image, status, color, ports in table:
+        status_col = f"{color}{status:<{status_w}}{cli.NC if color else ''}"
+        print(
+            f"{name:<{name_w}}  {cid:<{id_w}}  "
+            f"{image:<{image_w}}  {status_col}  {ports[0]}"
+        )
+        for extra in ports[1:]:
+            print(f"{indent}{extra}")
+
+    return 0
+
+
+def show_detail_format(container_name: Optional[str] = None, show_all: bool = True):
+    """Display containers in verbose/detail format."""
+    all_flag = ["--all"] if show_all else []
+
+    try:
+        if container_name:
+            # Find container by name
+            container_ids = run_docker_command_str(
+                ["ps"]
+                + all_flag
+                + ["--filter", f"name={container_name}", "--format", "{{.ID}}"],
+            ).split("\n")
+            container_ids = [cid for cid in container_ids if cid]
+
+            if not container_ids:
+                cli.print_error(f"No container found matching '{container_name}'")
+                return 1
+        else:
+            # Get all containers sorted by name
+            output = run_docker_command_str(
+                ["ps"] + all_flag + ["--format", "{{.Names}}\t{{.ID}}"]
+            )
+
+            if not output:
+                print("No containers found")
+                return 0
+
+            # Sort by name and extract IDs
+            lines = sorted(output.split("\n"))
+            container_ids = [line.split("\t")[1] for line in lines if line]
+
+        # Print details for each container
+        for container_id in container_ids:
+            info = get_container_info(container_id, show_all)
+            if info:
+                print_container_detail(info)
+
+        print(f"{cli.CYAN}{'━' * 78}{cli.NC}\n")
+        return 0
+
+    except Exception as e:
+        cli.print_error(f"Error running docker command: {e}")
+        return 1
+
+
+def main():
+    """Main function."""
+    # Handle plugin metadata
+    cli.handle_metadata(PLUGIN_METADATA)
+
+    # Parse arguments
+    parser = argparse.ArgumentParser(
+        description="Pretty print docker ps with multiple output formats",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  docker pps              # Brief table format (all containers)
+  docker pps -b           # Same as above
+  docker pps -v           # Verbose format for all containers
+  docker pps -v mycontainer  # Verbose format for specific container
+  docker pps --running    # Show only running containers
+        """,
+    )
+
+    output_group = parser.add_mutually_exclusive_group()
+    output_group.add_argument(
+        "-b", "--brief", action="store_true", help="Brief table format (default)"
+    )
+    output_group.add_argument(
+        "-v", "--verbose", action="store_true", help="Verbose detailed format"
+    )
+
+    parser.add_argument(
+        "--running",
+        action="store_true",
+        help="Show only running containers (exclude stopped ones)",
+    )
+    parser.add_argument(
+        "container", nargs="?", help="Container name to filter (only with -v/--verbose)"
+    )
+
+    # Parse arguments using cli handler
+    args = cli.parse_plugin_args(parser, ["docker-pps", "pps"])
+
+    # Determine if we should show all containers
+    show_all = not args.running
+
+    if args.container and not args.verbose:
+        cli.print_error("Container name can only be specified with -v/--verbose")
+        print("Use 'docker pps --help' for usage information", file=sys.stderr)
+        return 1
+
+    if args.verbose:
+        return show_detail_format(args.container, show_all)
+
+    return show_brief_format(show_all)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

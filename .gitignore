@@ -1,0 +1,11 @@
+# Local state the docker CLI dumps next to its config
+buildx/
+model/
+.token_seed*
+*.lock
+
+# Environment files (may contain secrets)
+compose.env
+
+# Python cache
+__pycache__/

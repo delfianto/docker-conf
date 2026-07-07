@@ -1,0 +1,8 @@
+{
+	"auths": {
+		"ghcr.io": {}
+	},
+	"psFormat": "table {{.Names}}\t{{.Status}}\t{{.Ports}}",
+	"imagesFormat": "table {{.ID}}\\t{{.Size}}\\t{{.Repository}}\\t{{.Tag}}",
+	"credsStore": "secretservice"
+}

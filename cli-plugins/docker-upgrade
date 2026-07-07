@@ -1,0 +1,438 @@
+#!/usr/bin/env python3
+"""Docker CLI plugin to pull updates for all local Docker images."""
+
+import argparse
+import functools
+import json
+import re
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
+from enum import Enum
+
+try:
+    import cli_helper as cli
+except ImportError:
+    import os
+
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import cli_helper as cli
+
+PLUGIN_METADATA = {
+    "SchemaVersion": "0.1.0",
+    "Vendor": "delfianto",
+    "Version": "2.1.0",
+    "ShortDescription": "Pull updates for all local Docker images",
+}
+
+
+class CheckStatus(Enum):
+    """Status codes for image update checks."""
+
+    NEEDS_UPDATE = 0
+    UP_TO_DATE = 1
+    LOCAL_ONLY = 2
+    FAILED = 3
+
+
+@dataclass
+class CheckResult:
+    """Result of a single image update check."""
+
+    image: str
+    status: CheckStatus
+    detail: str = ""
+
+
+def get_all_images():
+    """Get all Docker images with repository and tag."""
+    result = cli.run_docker_command(
+        ["image", "ls", "--format", "{{.Repository}}:{{.Tag}}"],
+        check=True,
+    )
+
+    images = []
+    for line in result.stdout.strip().split("\n"):
+        if line and not line.endswith(":") and "<none>" not in line:
+            images.append(line)
+
+    return sorted(images)
+
+
+# Manifest media types accepted when resolving a tag to a digest
+MANIFEST_ACCEPT = ", ".join(
+    (
+        "application/vnd.docker.distribution.manifest.list.v2+json",
+        "application/vnd.oci.image.index.v1+json",
+        "application/vnd.docker.distribution.manifest.v2+json",
+        "application/vnd.oci.image.manifest.v1+json",
+    )
+)
+
+
+@functools.lru_cache(maxsize=1)
+def has_buildx() -> bool:
+    """Check whether the buildx plugin is available."""
+    result = cli.run_docker_command(["buildx", "version"], check=False)
+    return result.returncode == 0
+
+
+def parse_image_ref(image: str) -> tuple[str, str, str]:
+    """Split an image reference into (registry, repository, tag)."""
+    registry = "registry-1.docker.io"
+    remainder = image
+
+    if "/" in image:
+        first, rest = image.split("/", 1)
+        # A registry host contains a dot or port, or is "localhost"
+        if "." in first or ":" in first or first == "localhost":
+            registry, remainder = first, rest
+
+    if registry in ("docker.io", "index.docker.io"):
+        registry = "registry-1.docker.io"
+
+    name, sep, tag = remainder.rpartition(":")
+    if not sep:
+        name, tag = remainder, "latest"
+
+    # Docker Hub official images live under the "library" namespace
+    if registry == "registry-1.docker.io" and "/" not in name:
+        name = f"library/{name}"
+
+    return registry, name, tag
+
+
+def fetch_bearer_token(challenge: str, repo: str) -> str | None:
+    """Get an anonymous bearer token from the auth service in a 401 challenge."""
+    if not challenge.lower().startswith("bearer"):
+        return None
+
+    fields = dict(re.findall(r'(\w+)="([^"]*)"', challenge))
+    realm = fields.get("realm")
+    if not realm:
+        return None
+
+    params = {"scope": f"repository:{repo}:pull"}
+    if "service" in fields:
+        params["service"] = fields["service"]
+
+    with urllib.request.urlopen(
+        f"{realm}?{urllib.parse.urlencode(params)}", timeout=30
+    ) as resp:
+        data = json.loads(resp.read())
+
+    return data.get("token") or data.get("access_token")
+
+
+def head_manifest_digest(image: str) -> tuple[str | None, str]:
+    """
+    Resolve the manifest digest for an image tag with a HEAD request.
+
+    HEAD requests to the manifest endpoint do not count toward Docker Hub
+    pull rate limits, unlike the manifest GET done by buildx imagetools.
+    Returns (digest, error_message); digest is None on failure.
+    """
+    registry, repo, tag = parse_image_ref(image)
+    url = f"https://{registry}/v2/{repo}/manifests/{urllib.parse.quote(tag)}"
+
+    def do_head(token: str | None = None):
+        req = urllib.request.Request(url, method="HEAD")
+        req.add_header("Accept", MANIFEST_ACCEPT)
+        if token:
+            req.add_header("Authorization", f"Bearer {token}")
+        return urllib.request.urlopen(req, timeout=30)
+
+    try:
+        try:
+            resp = do_head()
+        except urllib.error.HTTPError as e:
+            if e.code != 401:
+                raise
+            token = fetch_bearer_token(e.headers.get("WWW-Authenticate", ""), repo)
+            if not token:
+                return None, "401 unauthorized"
+            resp = do_head(token)
+
+        with resp:
+            digest = resp.headers.get("Docker-Content-Digest")
+        if not digest:
+            return None, "registry did not return a digest header"
+        return digest, ""
+
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return None, "not found"
+        return None, f"{e.code} {e.reason}"
+    except Exception as e:
+        return None, str(e)
+
+
+def get_local_digest(image: str) -> str | None:
+    """
+    Get the repo digest the image was pulled by.
+
+    Returns None for locally built images (no repo digest).
+    """
+    repo = image.rsplit(":", 1)[0]
+    result = cli.run_docker_command(
+        ["image", "inspect", "--format", '{{join .RepoDigests "\\n"}}', image],
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+
+    for line in result.stdout.strip().split("\n"):
+        if line.startswith(f"{repo}@"):
+            return line.split("@", 1)[1]
+
+    return None
+
+
+def buildx_remote_digest(image: str) -> tuple[str | None, str]:
+    """Get the remote digest via buildx imagetools (uses docker's credential store)."""
+    result = cli.run_docker_command(
+        ["buildx", "imagetools", "inspect", "--format", "{{.Manifest.Digest}}", image],
+        check=False,
+        timeout=60,
+    )
+    if result.returncode != 0:
+        error = result.stderr.strip().split("\n")[0]
+        return None, error or "could not fetch remote digest"
+
+    digest = result.stdout.strip()
+    if not digest:
+        return None, "could not fetch remote digest"
+    return digest, ""
+
+
+def get_remote_digest(image: str) -> tuple[str | None, str]:
+    """
+    Get the manifest digest for the image tag from its registry.
+
+    Tries an anonymous HEAD request first (free with respect to Docker Hub
+    rate limits), falling back to buildx imagetools for images that need
+    stored credentials. Returns (digest, error_message).
+    """
+    digest, error = head_manifest_digest(image)
+    if digest:
+        return digest, ""
+
+    # No point retrying through buildx when rate limited or missing upstream
+    if "not found" in error or "429" in error:
+        return None, error
+
+    if has_buildx():
+        return buildx_remote_digest(image)
+
+    return None, error
+
+
+def is_not_in_registry(error: str) -> bool:
+    """Check whether a registry error means the image has no upstream repository."""
+    patterns = ("repository does not exist", "pull access denied", "not found")
+    error = error.lower()
+    return any(p in error for p in patterns)
+
+
+def check_image(image: str) -> CheckResult:
+    """Check a single image for updates by comparing local and remote digests."""
+    local_digest = get_local_digest(image)
+    if local_digest is None:
+        return CheckResult(image, CheckStatus.LOCAL_ONLY)
+
+    remote_digest, error = get_remote_digest(image)
+    if remote_digest is None:
+        if is_not_in_registry(error):
+            return CheckResult(image, CheckStatus.LOCAL_ONLY)
+        return CheckResult(image, CheckStatus.FAILED, error)
+
+    if local_digest == remote_digest:
+        return CheckResult(image, CheckStatus.UP_TO_DATE)
+
+    return CheckResult(image, CheckStatus.NEEDS_UPDATE)
+
+
+def check_images_parallel(images: list, max_workers: int) -> list[CheckResult]:
+    """Check all images for updates in parallel."""
+    cli.print_info(f"Checking for updates ({max_workers} concurrent checks)...\n")
+
+    check_style = {
+        CheckStatus.NEEDS_UPDATE: ("↑", cli.YELLOW, "update available"),
+        CheckStatus.UP_TO_DATE: ("✓", cli.BLUE, "up to date"),
+        CheckStatus.LOCAL_ONLY: ("−", cli.CYAN, "local only, skipped"),
+        CheckStatus.FAILED: ("✗", cli.RED, "check failed"),
+    }
+
+    results = []
+    total = len(images)
+    done = 0
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_image = {executor.submit(check_image, img): img for img in images}
+
+        for future in as_completed(future_to_image):
+            img = future_to_image[future]
+            done += 1
+            try:
+                result = future.result()
+            except Exception as e:
+                result = CheckResult(img, CheckStatus.FAILED, str(e))
+            results.append(result)
+
+            symbol, color, label = check_style[result.status]
+            print(f"{color}{symbol}{cli.NC} [{done}/{total}] {img} {color}({label}){cli.NC}")
+            if result.status == CheckStatus.FAILED and result.detail:
+                print(f"    {result.detail}")
+
+    return results
+
+
+def pull_image(image: str, index: int, total: int) -> bool:
+    """
+    Pull a single Docker image, streaming output to the terminal
+    so docker renders its native layer progress bars.
+    """
+    # Flush so this line lands before the docker subprocess writes to the terminal
+    print(f"{cli.CYAN}[{index}/{total}]{cli.NC} Pulling {cli.GREEN}{image}{cli.NC}", flush=True)
+
+    try:
+        result = cli.run_docker_command(
+            ["pull", image],
+            check=False,
+            capture_output=False,
+            timeout=1800,  # 30 minute timeout per image
+        )
+        return result.returncode == 0
+    except Exception as e:
+        cli.print_error(f"  ✗ Error: {e}")
+        return False
+
+
+def print_summary(checks: list[CheckResult], updated: int, pull_failed: int):
+    """Print summary of check and pull operations."""
+    up_to_date = sum(1 for r in checks if r.status == CheckStatus.UP_TO_DATE)
+    local_only = sum(1 for r in checks if r.status == CheckStatus.LOCAL_ONLY)
+    check_failed = sum(1 for r in checks if r.status == CheckStatus.FAILED)
+
+    print()
+    cli.print_info("Summary:")
+    print(f"  Total images: {cli.BLUE}{len(checks)}{cli.NC}")
+    print(f"  {cli.GREEN}Updated: {updated}{cli.NC}")
+    print(f"  {cli.BLUE}Up to date: {up_to_date}{cli.NC}")
+    if local_only > 0:
+        print(f"  {cli.CYAN}Local only: {local_only}{cli.NC}")
+    if check_failed > 0:
+        print(f"  {cli.RED}Check failed: {check_failed}{cli.NC}")
+    if pull_failed > 0:
+        print(f"  {cli.RED}Pull failed: {pull_failed}{cli.NC}")
+
+
+def main():
+    """Main function."""
+    # Handle plugin metadata
+    cli.handle_metadata(PLUGIN_METADATA)
+
+    # Parse arguments
+    parser = argparse.ArgumentParser(
+        description="Pull updates for all local Docker images",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+
+    parser.add_argument(
+        "--dry-run",
+        "-n",
+        action="store_true",
+        help="Check for updates and show what would be pulled without pulling",
+    )
+    parser.add_argument(
+        "--filter",
+        "-f",
+        type=str,
+        default="",
+        help="Filter images by name (grep-style substring match)",
+    )
+    parser.add_argument(
+        "--workers",
+        "-w",
+        type=int,
+        default=8,
+        help="Number of parallel update checks (default: 8)",
+    )
+
+    # Parse arguments using cli handler
+    args = cli.parse_plugin_args(parser, ["docker-upgrade", "upgrade"])
+
+    try:
+        # Pass 1: list all local images
+        images = get_all_images()
+
+        # Apply filter if specified
+        if args.filter:
+            images = [img for img in images if args.filter in img]
+
+        total = len(images)
+
+        if total == 0:
+            cli.print_warning("No images found to check")
+            return 0
+
+        # Print header
+        cli.print_info("Docker Image Update Tool")
+        print(f"{cli.BLUE}Found {total} local image(s){cli.NC}")
+        print()
+
+        # Pass 2: check for updates in parallel
+        checks = check_images_parallel(images, max_workers=args.workers)
+        to_pull = sorted(r.image for r in checks if r.status == CheckStatus.NEEDS_UPDATE)
+
+        print()
+
+        # Dry run mode
+        if args.dry_run:
+            if to_pull:
+                cli.print_warning("DRY RUN MODE - No images will be pulled\n")
+                for image in to_pull:
+                    print(f"  {cli.CYAN}→{cli.NC} Would pull: {cli.GREEN}{image}{cli.NC}")
+                print()
+                cli.print_warning("Run without --dry-run to actually pull images")
+            else:
+                cli.print_success("All images are up to date")
+            print_summary(checks, updated=0, pull_failed=0)
+            return 0
+
+        # Pass 3: pull updated images sequentially with native progress bars
+        updated = 0
+        pull_failed = 0
+
+        if to_pull:
+            print(f"{cli.BLUE}{len(to_pull)} image(s) have updates{cli.NC}")
+            print()
+            for idx, image in enumerate(to_pull, 1):
+                if pull_image(image, idx, len(to_pull)):
+                    updated += 1
+                else:
+                    pull_failed += 1
+                print()  # Empty line between pulls
+        else:
+            cli.print_success("All images are up to date")
+
+        # Print summary
+        print_summary(checks, updated, pull_failed)
+
+        # Exit with error code if anything failed
+        check_failed = sum(1 for r in checks if r.status == CheckStatus.FAILED)
+        return 1 if (pull_failed > 0 or check_failed > 0) else 0
+
+    except KeyboardInterrupt:
+        cli.print_warning("\nInterrupted")
+        return 130
+    except Exception as e:
+        cli.print_error(f"Error: {e}")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

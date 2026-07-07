@@ -16,7 +16,7 @@ except ImportError:
 PLUGIN_METADATA = {
     "SchemaVersion": "0.1.0",
     "Vendor": "delfianto",
-    "Version": "1.0.0",
+    "Version": "2.0.0",
     "ShortDescription": "List Docker images grouped by registry and repository",
 }
 
@@ -24,8 +24,10 @@ PLUGIN_METADATA = {
 BOLD = "\033[1m"
 RESET = "\033[0m"
 
+type TagList = list[tuple[str, str]]  # (tag, size)
 
-def extract_registry(repo):
+
+def extract_registry(repo: str) -> str:
     """Extract the registry domain from a repository name."""
     # Has domain with dots (e.g., ghcr.io/user/repo or docker.io/library/nginx)
     if match := re.match(r"^([^/]+\.[^/]+)/", repo):
@@ -39,69 +41,84 @@ def extract_registry(repo):
     return "docker.io"
 
 
-def get_repositories():
-    """Get all unique repositories from Docker images."""
+def get_images() -> tuple[dict[str, dict[str, TagList]], int]:
+    """
+    Group images as registry -> repository -> [(tag, size)].
+
+    Returns the grouping and the number of dangling images.
+    """
     result = cli.run_docker_command(
-        ["image", "ls", "--format", "{{.Repository}}"],
+        ["image", "ls", "--format", "{{.Repository}}\t{{.Tag}}\t{{.Size}}"],
         check=True,
     )
 
-    return sorted(set(result.stdout.strip().split("\n")))
+    registries: dict[str, dict[str, TagList]] = defaultdict(lambda: defaultdict(list))
+    dangling = 0
 
-
-def get_images_for_repo(repo):
-    """Get all images for a specific repository."""
-    result = cli.run_docker_command(
-        ["image", "ls", repo, "--format", "{{.ID}}\t{{.Size}}\t{{.Tag}}"],
-        check=True,
-    )
-
-    images = []
     for line in result.stdout.strip().split("\n"):
-        if line:
-            parts = line.split("\t")
-            if len(parts) == 3:
-                images.append({"id": parts[0], "size": parts[1], "tag": parts[2]})
+        if not line:
+            continue
 
-    return images
+        repo, tag, size = line.split("\t")
+        if "<none>" in (repo, tag):
+            dangling += 1
+            continue
+
+        registry = extract_registry(repo)
+        # The section header already names the registry; don't repeat it
+        if repo.startswith(f"{registry}/"):
+            repo = repo[len(registry) + 1 :]
+        registries[registry][repo].append((tag, size))
+
+    return registries, dangling
 
 
-def main():
+def main() -> int:
     """Main function to list images grouped by registry."""
     # Handle plugin metadata
     cli.handle_metadata(PLUGIN_METADATA)
 
     try:
-        # Group repositories by registry
-        registry_repos = defaultdict(list)
-        for repo in get_repositories():
-            registry = extract_registry(repo)
-            registry_repos[registry].append(repo)
+        registries, dangling = get_images()
 
-        # Display grouped images
-        for registry in sorted(registry_repos.keys()):
-            # Print registry header
-            print(f"\n{cli.CYAN}{registry}{RESET}")
-            print("=" * len(registry))
+        if not registries and not dangling:
+            print("No images found")
+            return 0
 
-            for repo in registry_repos[registry]:
-                # Print repository name
-                print(f"\n  {BOLD}{repo}:{RESET}")
+        for registry in sorted(registries):
+            repos = registries[registry]
+            count = sum(len(tags) for tags in repos.values())
+            plural = "s" if count != 1 else ""
+            print(
+                f"\n{BOLD}{cli.CYAN}{registry}{RESET} "
+                f"{cli.BLUE}({count} image{plural}){cli.NC}"
+            )
 
-                # Print images for this repository
-                images = get_images_for_repo(repo)
-                for img in images:
-                    print(f"    {img['id']:<12} {img['size']:<10} {img['tag']}")
+            width = max(len(repo) for repo in repos)
+            for repo in sorted(repos):
+                tags = " · ".join(
+                    f"{cli.GREEN}{tag}{cli.NC} {cli.BLUE}({size}){cli.NC}"
+                    for tag, size in sorted(repos[repo])
+                )
+                print(f"  {repo:<{width}}  {tags}")
 
-        print()  # Final newline
+        print()
+        if dangling:
+            plural = "s" if dangling != 1 else ""
+            cli.print_warning(
+                f"{dangling} dangling image{plural} taking up space "
+                "(docker image prune)"
+            )
+
+        return 0
 
     except KeyboardInterrupt:
         cli.print_warning("\nInterrupted")
-        sys.exit(130)
+        return 130
     except Exception as e:
         cli.print_error(f"Error: {e}")
-        sys.exit(1)
+        return 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

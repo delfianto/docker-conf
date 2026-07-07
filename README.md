@@ -120,5 +120,5 @@ Run `docker pps` and enjoy output that fits on hardware you actually own.
 ## Requirements
 
 - Docker with the CLI plugin system (anything from this decade)
-- Python ≥ 3.11
+- Python ≥ 3.14
 - buildx (optional, only for `docker upgrade` against private registries)

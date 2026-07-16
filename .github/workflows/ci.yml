@@ -1,8 +1,12 @@
-name: CI
+name: ci
 on:
   push:
-    branches: [main, master]
+    branches: [main]
   pull_request:
+  workflow_dispatch:
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
   ci:
     runs-on: ubuntu-latest
@@ -10,11 +14,17 @@ jobs:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.x"
-      - name: Install declared dependencies
+          python-version: "3.14"
+      - name: install deps
         run: |
           python -m pip install --upgrade pip
-          [ -f requirements.txt ] && pip install -r requirements.txt || echo "no requirements.txt"
-          [ -f pyproject.toml ] && pip install . || echo "no installable pyproject"
-      - name: Syntax check
+          pip install ruff basedpyright
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          if [ -f requirements-dev.txt ]; then pip install -r requirements-dev.txt; fi
+          if [ -f pyproject.toml ] && grep -q '\[build-system\]' pyproject.toml; then pip install -e . || true; fi
+      - name: lint (ruff)
+        run: ruff check .
+      - name: type-check (basedpyright)
+        run: basedpyright
+      - name: build
         run: python -m compileall -q .

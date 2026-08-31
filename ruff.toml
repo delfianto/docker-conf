@@ -4,4 +4,4 @@ target-version = "py314"
 include = ["cli-plugins/*.py", "cli-plugins/docker-*"]
 
 [lint]
-extend-select = ["UP"]
+select = ["E4", "E7", "E9", "F", "UP"]
